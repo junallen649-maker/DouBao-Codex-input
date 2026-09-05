@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.doubao_user_data/
+.env
+*.log
+last_request_full.json
+*.docx
+*.png
+.tempmediaStorage/
+.system_generated/
