@@ -13,14 +13,6 @@
 
 ---
 
-## 💡 为什么需要本项目？
-
-1. **官方 ChatGPT 频频受限**：国内访问 OpenAI 官方容易遭遇网络封锁、账号封控、高昂 API 账单。
-2. **Codex 协议报错“正在重新连接 3/5”**：Codex 2026 客户端全面升级为 **Responses API**（`wire_api = "responses"`），传统 `/v1/chat/completions` 反代直接报协议解析崩溃。本项目完整实现了 Responses API 全生命周期事件流。
-3. **彻底打破“我无法在你的桌面创建文件”的限制**：常规的大模型 Web 端只是聊天框，一旦要求在电脑桌面创建文件就会推辞。本项目研发了 **Computer Control Agent Bridge**，让豆包真正具备如官方高权限 Agent 一般的本地操作与文件落盘能力！
-
----
-
 ## ✨ 核心特性
 
 - 🎯 **完美适配 OpenAI Codex 桌面端**：原生兼容 Codex 最新 Responses API 协议规范，告别中断与重新连接。
