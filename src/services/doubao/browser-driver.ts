@@ -21,6 +21,7 @@ export class DoubaoBrowserDriver {
   private activeRequests = new Map<string, RequestCallbacks>();
   private isInitializing = false;
   private initPromise: Promise<void> | null = null;
+  private requestQueue: Promise<void> = Promise.resolve();
 
   public networkLogs: Array<{ time: string; type: 'req' | 'resp'; method?: string; url: string; status?: number; body?: string }> = [];
 
@@ -29,6 +30,29 @@ export class DoubaoBrowserDriver {
       DoubaoBrowserDriver.instance = new DoubaoBrowserDriver();
     }
     return DoubaoBrowserDriver.instance;
+  }
+
+  /**
+   * Enqueue tasks to run sequentially on the single browser page
+   */
+  private enqueueTask<T>(task: () => Promise<T>): Promise<T> {
+    let resolveNext: () => void;
+    const nextPromise = new Promise<void>((resolve) => {
+      resolveNext = resolve;
+    });
+
+    const currentQueue = this.requestQueue;
+    this.requestQueue = nextPromise;
+
+    return currentQueue
+      .catch(() => {})
+      .then(async () => {
+        try {
+          return await task();
+        } finally {
+          resolveNext();
+        }
+      });
   }
 
   /**
@@ -289,135 +313,144 @@ export class DoubaoBrowserDriver {
     onFinish: (conversationId?: string) => void;
     onError: (err: Error) => void;
   }): Promise<void> {
-    await this.init();
+    return this.enqueueTask(async () => {
+      await this.init();
 
-    if (!this.page) {
-      throw new Error('Browser page is not initialized');
-    }
-
-    let isFinished = false;
-
-    const safeChunk = (text: string) => {
-      if (!isFinished && text) {
-        options.onChunk(text, options.conversationId);
+      if (!this.page) {
+        throw new Error('Browser page is not initialized');
       }
-    };
 
-    const safeFinish = () => {
-      if (!isFinished) {
-        isFinished = true;
-        options.onFinish(options.conversationId);
-      }
-    };
+      let isFinished = false;
 
-    const safeError = (err: Error) => {
-      if (!isFinished) {
-        isFinished = true;
-        options.onError(err);
-      }
-    };
+      const safeChunk = (text: string) => {
+        if (!isFinished && text) {
+          options.onChunk(text, options.conversationId);
+        }
+      };
 
-    try {
-      const page = this.page;
-      console.log('[Driver] chatCompletion called. Prompt:', options.prompt);
+      const safeFinish = () => {
+        if (!isFinished) {
+          isFinished = true;
+          options.onFinish(options.conversationId);
+        }
+      };
 
-      // 1. Record existing answer count before sending
-      const initialCount = await page.evaluate(() => {
-        return document.querySelectorAll('[class*="md-box-root"]').length;
-      });
-      console.log('[Driver] Step 1: Initial box count =', initialCount);
+      const safeError = (err: Error) => {
+        if (!isFinished) {
+          isFinished = true;
+          options.onError(err);
+        }
+      };
 
-      const editor = page.locator('div.tiptap.ProseMirror[contenteditable="true"]').first();
-      console.log('[Driver] Step 2: Clicking editor...');
-      await editor.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
-      await editor.click();
-      await page.waitForTimeout(100);
-      await page.keyboard.press('Control+A');
-      await page.keyboard.press('Backspace');
-      await page.waitForTimeout(100);
+      try {
+        const page = this.page;
+        console.log('[Driver] chatCompletion called. Prompt preview:', options.prompt.substring(0, 80));
 
-      // Fast typing into ProseMirror editor
-      const promptText = options.prompt.trim();
-      const delay = promptText.length > 200 ? 1 : 10;
-      console.log('[Driver] Step 3: Typing prompt...');
-      await editor.pressSequentially(promptText, { delay });
-      await page.waitForTimeout(300);
+        // 1. Record existing answer count before sending
+        const initialCount = await page.evaluate(() => {
+          return document.querySelectorAll('[class*="md-box-root"]').length;
+        });
+        console.log('[Driver] Step 1: Initial box count =', initialCount);
 
-      const sendBtn = page.locator('#flow-end-msg-send').first();
-      const isSendVisible = await sendBtn.isVisible({ timeout: 2000 }).catch(() => false);
-      console.log('[Driver] Step 4: Is #flow-end-msg-send visible?', isSendVisible);
+        const editor = page.locator('div.tiptap.ProseMirror[contenteditable="true"]').first();
+        console.log('[Driver] Step 2: Clearing and focusing editor...');
+        await editor.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+        await editor.click();
+        await page.waitForTimeout(50);
+        
+        // Multi-level clean: DOM reset + keyboard select all & backspace
+        await page.evaluate(() => {
+          const ed = document.querySelector('div.tiptap.ProseMirror[contenteditable="true"]');
+          if (ed) ed.innerHTML = '<p></p>';
+        });
+        await page.keyboard.press('Control+A');
+        await page.keyboard.press('Backspace');
+        await page.waitForTimeout(50);
+        await editor.click();
 
-      if (isSendVisible) {
-        await sendBtn.click();
-      } else {
-        console.log('[Driver] Send button not visible, pressing Enter...');
-        await page.keyboard.press('Enter');
-      }
-      await page.waitForTimeout(500);
-
-      // 2. Poll until assistant answer box appears and finishes generating
-      let lastText = '';
-      let sameCount = 0;
-      const startTime = Date.now();
-      console.log('[Driver] Step 5: Polling loop started...');
-
-      while (Date.now() - startTime < 120000 && !isFinished) {
+        // Fast typing into ProseMirror editor (delay 0 to avoid collision/slowness)
+        const promptText = options.prompt.trim();
+        const delay = promptText.length > 50 ? 0 : 2;
+        console.log('[Driver] Step 3: Typing prompt of length:', promptText.length);
+        await editor.pressSequentially(promptText, { delay });
         await page.waitForTimeout(200);
 
-        const state = await page.evaluate((prevCount: number) => {
-          const boxes = Array.from(document.querySelectorAll('[class*="md-box-root"]'));
-          const stopBtn = document.querySelector('button[aria-label*="停止"], button[title*="停止"], [class*="stop-btn"], button[data-testid*="stop"], [class*="stop-icon"]');
-          const isGenerating = Boolean(stopBtn);
+        const sendBtn = page.locator('#flow-end-msg-send').first();
+        const isSendVisible = await sendBtn.isVisible({ timeout: 2000 }).catch(() => false);
+        console.log('[Driver] Step 4: Is #flow-end-msg-send visible?', isSendVisible);
 
-          // Assistant message box exists if count is at least prevCount + 2 (user message is prevCount + 1)
-          // or if new conversation reset count to 2
-          const hasAssistantBox = (boxes.length >= prevCount + 2) || (boxes.length >= 2 && prevCount > boxes.length);
-          if (!hasAssistantBox) {
-            return { hasNewBox: false, text: '', isGenerating, boxCount: boxes.length };
-          }
+        if (isSendVisible) {
+          await sendBtn.click();
+        } else {
+          console.log('[Driver] Send button not visible, pressing Enter...');
+          await page.keyboard.press('Enter');
+        }
+        await page.waitForTimeout(500);
 
-          const targetBox = boxes[boxes.length - 1];
-          const text = (targetBox as HTMLElement).innerText?.trim() || '';
+        // 2. Poll until assistant answer box appears and finishes generating
+        let lastText = '';
+        let sameCount = 0;
+        const startTime = Date.now();
+        console.log('[Driver] Step 5: Polling loop started...');
 
-          return { hasNewBox: Boolean(text), text, isGenerating, boxCount: boxes.length };
-        }, initialCount);
+        while (Date.now() - startTime < 120000 && !isFinished) {
+          await page.waitForTimeout(200);
 
-        if (state.hasNewBox && state.text.length > lastText.length) {
-          const delta = state.text.slice(lastText.length);
-          lastText = state.text;
-          sameCount = 0;
-          console.log('[Driver] Emitting delta of length', delta.length, 'total now:', lastText.length);
-          safeChunk(delta);
-        } else if (state.hasNewBox && state.text.length > 0) {
-          sameCount++;
-          if (state.isGenerating) {
-            // Actively generating in browser: do not break prematurely unless inactive for > 15s
-            if (sameCount >= 75) {
-              console.log('[Driver] Generation stuck while isGenerating=true, breaking.');
-              break;
+          const state = await page.evaluate((prevCount: number) => {
+            const boxes = Array.from(document.querySelectorAll('[class*="md-box-root"]'));
+            const stopBtn = document.querySelector('button[aria-label*="停止"], button[title*="停止"], [class*="stop-btn"], button[data-testid*="stop"], [class*="stop-icon"]');
+            const isGenerating = Boolean(stopBtn);
+
+            // Assistant message box exists if count is at least prevCount + 2 (user message is prevCount + 1)
+            // or if new conversation reset count to 2
+            const hasAssistantBox = (boxes.length >= prevCount + 2) || (boxes.length >= 2 && prevCount > boxes.length);
+            if (!hasAssistantBox) {
+              return { hasNewBox: false, text: '', isGenerating, boxCount: boxes.length };
             }
-          } else {
-            // Not generating (stop button and cursor gone). Require at least 10 ticks (2s) of silence
-            if (sameCount >= 10) {
-              console.log('[Driver] Generation finished detected. sameCount:', sameCount, 'final length:', state.text.length);
-              break;
+
+            const targetBox = boxes[boxes.length - 1];
+            const text = (targetBox as HTMLElement).innerText?.trim() || '';
+
+            return { hasNewBox: Boolean(text), text, isGenerating, boxCount: boxes.length };
+          }, initialCount);
+
+          if (state.hasNewBox && state.text.length > lastText.length) {
+            const delta = state.text.slice(lastText.length);
+            lastText = state.text;
+            sameCount = 0;
+            console.log('[Driver] Emitting delta of length', delta.length, 'total now:', lastText.length);
+            safeChunk(delta);
+          } else if (state.hasNewBox && state.text.length > 0) {
+            sameCount++;
+            if (state.isGenerating) {
+              // Actively generating in browser: do not break prematurely unless inactive for > 15s
+              if (sameCount >= 75) {
+                console.log('[Driver] Generation stuck while isGenerating=true, breaking.');
+                break;
+              }
+            } else {
+              // Not generating (stop button and cursor gone). Require at least 10 ticks (2s) of silence
+              if (sameCount >= 10) {
+                console.log('[Driver] Generation finished detected. sameCount:', sameCount, 'final length:', state.text.length);
+                break;
+              }
             }
           }
         }
+
+        console.log('[Driver] Loop ended. lastText length:', lastText.length);
+
+        // If nothing extracted after timeout, fallback
+        if (!lastText) {
+          safeChunk('你好！我是豆包，已成功连接。');
+        }
+
+        safeFinish();
+      } catch (err: any) {
+        console.error('[Driver] chatCompletion error:', err);
+        safeError(err);
       }
-
-      console.log('[Driver] Loop ended. lastText length:', lastText.length);
-
-      // If nothing extracted after timeout, fallback
-      if (!lastText) {
-        safeChunk('你好！我是豆包，已成功连接。');
-      }
-
-      safeFinish();
-    } catch (err: any) {
-      console.error('[Driver] chatCompletion error:', err);
-      safeError(err);
-    }
+    });
   }
 
   /**

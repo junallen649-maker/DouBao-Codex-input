@@ -6,42 +6,141 @@ import { ComputerControlEngine } from '../services/agent/computer-control.js';
 
 export const responsesRouter = Router();
 
+function cleanPromptText(text: string): string {
+  if (!text) return '';
+  return text.replace(/<environment_context>[\s\S]*?<\/environment_context>/g, '').trim();
+}
+
 function extractInputText(input: any): string {
   if (!input) return '';
-  if (typeof input === 'string') return input;
+  if (typeof input === 'string') return cleanPromptText(input);
   if (Array.isArray(input)) {
-    // 1. First look for user messages
-    const userMessages = input.filter(item => item && (item.role === 'user' || (item.type === 'message' && item.role === 'user')));
+    // 1. First look for user messages that have actual content (not just environment context)
+    const userMessages = input.filter(item => {
+      if (!item) return false;
+      const isUser = item.role === 'user' || (item.type === 'message' && item.role === 'user');
+      if (!isUser) return false;
+      let text = typeof item.content === 'string' ? item.content :
+        (Array.isArray(item.content) ? item.content.map((p: any) => p.text || p.input_text || '').join('\n') : item.text || '');
+      text = cleanPromptText(text);
+      return text.length > 0;
+    });
+
     if (userMessages.length > 0) {
       const lastUser = userMessages[userMessages.length - 1];
-      if (typeof lastUser.content === 'string') return lastUser.content;
-      if (Array.isArray(lastUser.content)) {
-        return lastUser.content.map((p: any) => (typeof p === 'string' ? p : p.text || p.input_text || '')).filter(Boolean).join('\n');
-      }
-      if (lastUser.text) return lastUser.text;
+      let text = '';
+      if (typeof lastUser.content === 'string') text = lastUser.content;
+      else if (Array.isArray(lastUser.content)) {
+        text = lastUser.content.map((p: any) => (typeof p === 'string' ? p : p.text || p.input_text || '')).filter(Boolean).join('\n');
+      } else if (lastUser.text) text = lastUser.text;
+      text = cleanPromptText(text);
+      if (text) return text;
     }
 
     // 2. Look for non-developer messages
     for (let i = input.length - 1; i >= 0; i--) {
       const item = input[i];
-      if (typeof item === 'string') return item;
+      if (typeof item === 'string') {
+        const cleaned = cleanPromptText(item);
+        if (cleaned) return cleaned;
+      }
       if (typeof item === 'object' && item !== null) {
         if (item.role !== 'developer' && item.role !== 'system') {
-          if (typeof item.content === 'string') return item.content;
-          if (Array.isArray(item.content)) {
-            return item.content.map((p: any) => (typeof p === 'string' ? p : p.text || p.input_text || '')).filter(Boolean).join('\n');
-          }
-          if (item.text) return item.text;
+          let text = '';
+          if (typeof item.content === 'string') text = item.content;
+          else if (Array.isArray(item.content)) {
+            text = item.content.map((p: any) => (typeof p === 'string' ? p : p.text || p.input_text || '')).filter(Boolean).join('\n');
+          } else if (item.text) text = item.text;
+          text = cleanPromptText(text);
+          if (text) return text;
         }
       }
     }
 
     // 3. Fallback: take last item's text
     const lastItem = input[input.length - 1];
-    if (typeof lastItem === 'string') return lastItem;
-    if (lastItem && typeof lastItem.content === 'string') return lastItem.content;
+    if (typeof lastItem === 'string') return cleanPromptText(lastItem);
+    if (lastItem && typeof lastItem.content === 'string') return cleanPromptText(lastItem.content);
   }
-  return String(input);
+  return cleanPromptText(String(input));
+}
+
+export function isTitleGenerationRequest(body: any, rawPrompt: string): { isTitle: boolean; title?: string } {
+  const jsonStr = typeof body === 'object' ? JSON.stringify(body) : String(body);
+  const isTitle =
+    jsonStr.includes('provide a short title for a task') ||
+    jsonStr.includes('task title based solely on the prompt') ||
+    jsonStr.includes('clear, informative task title') ||
+    jsonStr.includes('title for a task') ||
+    jsonStr.includes('formatting characters, or trailing punctuation') ||
+    jsonStr.includes('core change requested. The title') ||
+    rawPrompt.includes('provide a short title for a task') ||
+    rawPrompt.includes('task title based solely on the prompt') ||
+    rawPrompt.includes('title for a task') ||
+    rawPrompt.includes('formatting characters, or trailing punctuation') ||
+    rawPrompt.includes('core change requested. The title');
+
+  if (!isTitle) return { isTitle: false };
+
+  let userQuery = '';
+  const tagMatch = jsonStr.match(/<user_prompt>([\s\S]*?)<\/user_prompt>/i);
+  if (tagMatch && tagMatch[1]) {
+    userQuery = tagMatch[1].trim();
+  }
+
+  if (!userQuery) {
+    const colonMatch = jsonStr.match(/(?:User prompt|User Prompt|Prompt):\s*([^\n\r"]+)/i);
+    if (colonMatch && colonMatch[1]) {
+      userQuery = colonMatch[1].trim();
+    }
+  }
+
+  if (!userQuery && Array.isArray(body.input)) {
+    for (let i = body.input.length - 1; i >= 0; i--) {
+      const item = body.input[i];
+      if (item && item.role === 'user') {
+        let text = typeof item.content === 'string' ? item.content :
+          (Array.isArray(item.content) ? item.content.map((c: any) => c.text || c.input_text || '').join(' ') : item.text || '');
+        text = cleanPromptText(text);
+        if (text && !text.includes('provide a short title') && !text.includes('title for a task')) {
+          userQuery = text.trim();
+          break;
+        }
+      }
+    }
+  }
+
+  if (!userQuery && Array.isArray(body.messages)) {
+    for (let i = body.messages.length - 1; i >= 0; i--) {
+      const item = body.messages[i];
+      if (item && item.role === 'user') {
+        let text = typeof item.content === 'string' ? item.content :
+          (Array.isArray(item.content) ? item.content.map((c: any) => c.text || c.input_text || '').join(' ') : item.text || '');
+        text = cleanPromptText(text);
+        if (text && !text.includes('provide a short title') && !text.includes('title for a task')) {
+          userQuery = text.trim();
+          break;
+        }
+      }
+    }
+  }
+
+  if (!userQuery) {
+    userQuery = rawPrompt
+      .replace(/<environment_context>[\s\S]*?<\/environment_context>/g, '')
+      .replace(/You are a helpful assistant[\s\S]*?good title:\s*/gi, '')
+      .trim();
+  }
+
+  let title = '新对话';
+  if (userQuery) {
+    const clean = userQuery.replace(/[\r\n\t]+/g, ' ').replace(/[#*`_"\']+/g, '').trim();
+    if (clean.length > 0) {
+      title = clean.length <= 12 ? clean : clean.slice(0, 12);
+    }
+  }
+
+  return { isTitle: true, title };
 }
 
 function sseEvent(event: string, data: any): string {
@@ -67,6 +166,125 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   const modelId = body.model || config.defaultModel;
   const isStream = body.stream !== false; // Default to streaming for responses API
   const rawPrompt = extractInputText(body.input) || extractInputText(body.messages) || '你好';
+
+  const responseId = `resp_${uuidv4()}`;
+  const itemId = `msg_${uuidv4()}`;
+  const now = Math.floor(Date.now() / 1000);
+
+  // Check if Codex is asking for a thread title in the background
+  const titleCheck = isTitleGenerationRequest(body, rawPrompt);
+  if (titleCheck.isTitle) {
+    const titleText = titleCheck.title || '新对话';
+    console.log('[Responses API] Handled Codex Title Generation Request instantly with title:', titleText);
+    if (isStream) {
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.write(sseEvent('response.created', {
+        response: {
+          id: responseId,
+          object: 'response',
+          created_at: now,
+          status: 'in_progress',
+          model: modelId,
+          output: []
+        }
+      }));
+      res.write(sseEvent('response.output_item.added', {
+        response_id: responseId,
+        output_index: 0,
+        item: {
+          id: itemId,
+          type: 'message',
+          status: 'in_progress',
+          role: 'assistant',
+          content: []
+        }
+      }));
+      res.write(sseEvent('response.content_part.added', {
+        response_id: responseId,
+        item_id: itemId,
+        output_index: 0,
+        content_index: 0,
+        part: { type: 'output_text', text: '' }
+      }));
+      res.write(sseEvent('response.output_text.delta', {
+        response_id: responseId,
+        item_id: itemId,
+        output_index: 0,
+        content_index: 0,
+        delta: titleText
+      }));
+      res.write(sseEvent('response.output_text.done', {
+        response_id: responseId,
+        item_id: itemId,
+        output_index: 0,
+        content_index: 0,
+        text: titleText
+      }));
+      res.write(sseEvent('response.content_part.done', {
+        response_id: responseId,
+        item_id: itemId,
+        output_index: 0,
+        content_index: 0,
+        part: { type: 'output_text', text: titleText }
+      }));
+      res.write(sseEvent('response.output_item.done', {
+        response_id: responseId,
+        output_index: 0,
+        item: {
+          id: itemId,
+          type: 'message',
+          status: 'completed',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: titleText }]
+        }
+      }));
+      res.write(sseEvent('response.completed', {
+        response: {
+          id: responseId,
+          object: 'response',
+          created_at: now,
+          status: 'completed',
+          model: modelId,
+          output: [{
+            id: itemId,
+            type: 'message',
+            status: 'completed',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: titleText }]
+          }],
+          usage: {
+            total_tokens: titleText.length,
+            input_tokens: 10,
+            output_tokens: titleText.length
+          }
+        }
+      }));
+      return res.end();
+    } else {
+      return res.json({
+        id: responseId,
+        object: 'response',
+        created_at: now,
+        status: 'completed',
+        model: modelId,
+        output: [{
+          id: itemId,
+          type: 'message',
+          status: 'completed',
+          role: 'assistant',
+          content: [{ type: 'text', text: titleText }]
+        }],
+        usage: {
+          total_tokens: titleText.length,
+          input_tokens: 10,
+          output_tokens: titleText.length
+        }
+      });
+    }
+  }
+
   const plan = ComputerControlEngine.analyzeIntent(rawPrompt);
   const prompt = plan.isOperational ? plan.enhancedPrompt : rawPrompt;
   console.log('[Responses API] Processed prompt with operational plan:', {
@@ -77,10 +295,6 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   });
 
   const conversationId = body.conversation_id;
-
-  const responseId = `resp_${uuidv4()}`;
-  const itemId = `msg_${uuidv4()}`;
-  const now = Math.floor(Date.now() / 1000);
 
   const driver = DoubaoBrowserDriver.getInstance();
 

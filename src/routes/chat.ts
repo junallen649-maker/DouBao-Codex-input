@@ -4,6 +4,7 @@ import { ChatCompletionRequest } from '../types/openai.js';
 import { OpenAIConverter } from '../services/openai/converter.js';
 import { DoubaoBrowserDriver } from '../services/doubao/browser-driver.js';
 import { config, SUPPORTED_MODELS } from '../config.js';
+import { isTitleGenerationRequest } from './responses.js';
 
 export const chatRouter = Router();
 
@@ -26,6 +27,39 @@ chatRouter.post('/chat/completions', async (req: Request, res: Response) => {
   const prompt = OpenAIConverter.messagesToPrompt(body.messages);
   const conversationId = body.conversation_id;
   const completionId = `chatcmpl-${uuidv4()}`;
+
+  // Check if this is a title generation request
+  const titleCheck = isTitleGenerationRequest(body, prompt);
+  if (titleCheck.isTitle) {
+    const titleText = titleCheck.title || '新对话';
+    console.log('[Chat API] Handled Title Generation Request instantly with title:', titleText);
+    if (isStream) {
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders?.();
+      res.write(OpenAIConverter.createInitialChunk(completionId, modelId));
+      res.write(OpenAIConverter.createDeltaChunk(completionId, modelId, { content: titleText }, conversationId));
+      res.write(OpenAIConverter.createFinalChunk(completionId, modelId, conversationId));
+      return res.end();
+    } else {
+      return res.json({
+        id: completionId,
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model: modelId,
+        choices: [
+          {
+            index: 0,
+            message: { role: 'assistant', content: titleText },
+            finish_reason: 'stop'
+          }
+        ],
+        usage: { prompt_tokens: 10, completion_tokens: titleText.length, total_tokens: 10 + titleText.length }
+      });
+    }
+  }
 
   const driver = DoubaoBrowserDriver.getInstance();
 
